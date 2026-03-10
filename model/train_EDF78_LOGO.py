@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import copy
 import os
 import numpy as np
 import json
@@ -19,7 +20,7 @@ DATASET_ROOT = "D:/sleep_project/dataset/SleepEDF-78" # 请根据本地实际路
 CHANNELS = ["EEG Fpz-Cz", "EEG Pz-Oz"]
 FS = 100
 BATCH_SIZE = 64             
-EPOCHS = 30
+EPOCHS = 50
 LR = 1e-3
 
 SAVE_DIR = "./checkpoints_edf78_loso"
@@ -103,6 +104,10 @@ def run_logo_fold(fold_idx, train_loader, test_loader):
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
     
     history = {'train_loss':[], 'train_acc':[], 'val_loss':[], 'val_acc':[]}
+    best_val_loss = float('inf')
+    best_state = None
+    patience = 10
+    no_improve = 0
     
     for epoch in range(EPOCHS):
         model.train()
@@ -133,11 +138,28 @@ def run_logo_fold(fold_idx, train_loader, test_loader):
 
         history['train_loss'].append(train_loss / len(train_loader))
         history['train_acc'].append(correct_train / total_train)
-        history['val_loss'].append(val_loss / len(test_loader))
+        avg_val_loss = val_loss / len(test_loader)
+        history['val_loss'].append(avg_val_loss)
         history['val_acc'].append(correct_val / total_val)
         
+        # 早停：基于验证集 loss
+        if avg_val_loss < best_val_loss - 1e-4:
+            best_val_loss = avg_val_loss
+            best_state = copy.deepcopy(model.state_dict())
+            no_improve = 0
+        else:
+            no_improve += 1
+        
         if (epoch + 1) % 5 == 0:
-            print(f"Fold {fold_idx} | Epoch {epoch+1:02d} | Train Acc: {history['train_acc'][-1]:.4f} | Val Acc: {history['val_acc'][-1]:.4f}")
+            print(f"Fold {fold_idx} | Epoch {epoch+1:02d} | Train Acc: {history['train_acc'][-1]:.4f} | Val Acc: {history['val_acc'][-1]:.4f} | Val Loss: {avg_val_loss:.4f}")
+
+        if no_improve >= patience:
+            print(f"Fold {fold_idx} | Early stopping at epoch {epoch+1}, best Val Loss: {best_val_loss:.4f}")
+            break
+
+    # 加载最佳验证表现的权重
+    if best_state is not None:
+        model.load_state_dict(best_state)
 
     # 获取预测结果
     y_true_fold, y_pred_fold, y_prob_fold = [], [], []

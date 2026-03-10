@@ -238,7 +238,7 @@ class PriorMatrixBuilder(nn.Module):
         return A_init
 
 class SCGAT(nn.Module):
-    def __init__(self, in_channels, out_channels, stage_dim=64, num_stages=5, num_heads=8):
+    def __init__(self, in_channels, out_channels, stage_dim=64, num_stages=5, num_heads=4):
         super(SCGAT, self).__init__()
         self.num_heads = num_heads
         self.d_k = out_channels // num_heads
