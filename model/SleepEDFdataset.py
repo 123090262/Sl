@@ -134,7 +134,7 @@ def get_subject_data_dict(root_path, subject_list, channels):
             
     return data_dict
 
-def create_dataloader(data_dict, sub_ids, batch_size=16, shuffle=True,num_workers = 8):
+def create_dataloader(data_dict, sub_ids, batch_size=16, shuffle=True, num_workers=0):
     """合并受试者并创建 DataLoader (同 ISRUC)"""
     all_X = np.concatenate([data_dict[sid][0] for sid in sub_ids if sid in data_dict], axis=0)
     all_y = np.concatenate([data_dict[sid][1] for sid in sub_ids if sid in data_dict], axis=0)
@@ -143,45 +143,5 @@ def create_dataloader(data_dict, sub_ids, batch_size=16, shuffle=True,num_worker
     tensor_y = torch.tensor(all_y).long()
     
     dataset = TensorDataset(tensor_x, tensor_y)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
 
-# --- 3. 快速测试 (可选) ---
-def print_dataset_statistics(data_dict):
-    """
-    统计并输出数据库各阶段样本分布表格
-    """
-    all_y = np.concatenate([v[1] for v in data_dict.values()], axis=0)
-    unique, counts = np.unique(all_y, return_counts=True)
-    stats = dict(zip(unique, counts))
-    
-    stage_names = {0: "W (Wake)", 1: "N1", 2: "N2", 3: "N3 (Slow Wave)", 4: "REM"}
-    
-    print("\n" + "="*45)
-    print(f"{'Sleep Stage':<20} | {'Count':<10} | {'Percentage':<10}")
-    print("-" * 45)
-    
-    total = len(all_y)
-    for i in range(5):
-        count = stats.get(i, 0)
-        percentage = (count / total) * 100
-        name = stage_names.get(i, "Unknown")
-        print(f"{name:<20} | {count:<10} | {percentage:>8.2f}%")
-    
-    print("-" * 45)
-    print(f"{'Total Epochs':<20} | {total:<10} | 100.00%")
-    print("="*45 + "\n")
-
-# --- 主程序逻辑修改 ---
-if __name__ == "__main__":
-    ROOT = r"E:\EEG\dataset\sleep-edf-database-expanded-1.0.0\SleepEDF-78"
-    SUBS = [f"SC4{i:02d}" for i in range(78)] # 可根据实际文件夹填充
-    CHNS = ["EEG Fpz-Cz", "EEG Pz-Oz"]
-    
-    data = get_subject_data_dict(ROOT, SUBS, CHNS)
-    
-    if data:
-        # 输出统计表格
-        print_dataset_statistics(data)
-        
-        loader = create_dataloader(data, SUBS)
-        # 后续训练代码...
