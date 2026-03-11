@@ -1,7 +1,7 @@
 import os
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, Dataset
 from pyedflib import EdfReader
 from scipy.signal import butter, filtfilt
 
@@ -134,14 +134,50 @@ def get_subject_data_dict(root_path, subject_list, channels):
             
     return data_dict
 
-def create_dataloader(data_dict, sub_ids, batch_size=16, shuffle=True,num_workers = 8):
-    """合并受试者并创建 DataLoader (同 ISRUC)"""
+class SeqSleepDataset(Dataset):
+    def __init__(self, X, y, seq_len=5):
+        """
+        X: (N, C, L) 所有的 EEG 信号片段
+        y: (N,) 对应的标签
+        seq_len: 序列长度（必须为奇数，如 5, 意味着前后各看 2 个 epoch）
+        """
+        self.X = X
+        self.y = y
+        self.seq_len = seq_len
+        self.pad_len = seq_len // 2
+        
+        # 对首尾进行 Padding，保证第一个和最后一个 Epoch 也能作为中心点被预测
+        # 信号特征 padding 0，标签 padding -1 (不过标签只取中心点，不会用到 pad 的值)
+        self.X_padded = np.pad(self.X, ((self.pad_len, self.pad_len), (0, 0), (0, 0)), mode='constant')
+        
+    def __len__(self):
+        return len(self.y)
+    
+    def __getitem__(self, idx):
+        # 取以 idx 为中心的序列
+        start_idx = idx
+        end_idx = idx + self.seq_len
+        
+        X_seq = self.X_padded[start_idx:end_idx] # (seq_len, C, L)
+        y_center = self.y[idx]                   # 中心 Epoch 的标签
+        
+        return torch.FloatTensor(X_seq), torch.LongTensor([y_center])[0]
+
+def create_dataloader(data_dict, sub_ids, batch_size=16, shuffle=True, num_workers=0, seq_len=5):
+    """合并受试者并创建支持时序上下文的 DataLoader"""
+    # 提取并拼接指定受试者的数据
     all_X = np.concatenate([data_dict[sid][0] for sid in sub_ids if sid in data_dict], axis=0)
     all_y = np.concatenate([data_dict[sid][1] for sid in sub_ids if sid in data_dict], axis=0)
     
-    tensor_x = torch.tensor(all_X, dtype=torch.float32)
-    tensor_y = torch.tensor(all_y).long()
+    # 使用自定义的序列 Dataset
+    dataset = SeqSleepDataset(all_X, all_y, seq_len=seq_len)
     
-    dataset = TensorDataset(tensor_x, tensor_y)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+    loader = DataLoader(
+        dataset, 
+        batch_size=batch_size, 
+        shuffle=shuffle, 
+        num_workers=num_workers,
+        drop_last=False
+    )
+    return loader
 
