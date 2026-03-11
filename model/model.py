@@ -3,11 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class SleepGATNet(nn.Module):
-    def __init__(self, channel_names, fs=100, num_stages=5, feature_dim=128, hid_dim=256):
+    def __init__(self, channel_names, fs=100, num_stages=5, feature_dim=128, hid_dim=256, seq_len=5):
         super(SleepGATNet, self).__init__()
         self.C = len(channel_names)
         self.fs = fs
-        
+        self.seq_len = seq_len
         # 1. 结构先验构建器
         self.prior_builder = PriorMatrixBuilder(channel_names=channel_names)
         
@@ -32,67 +32,83 @@ class SleepGATNet(nn.Module):
             num_stages=num_stages
         )
         
-        # 4. 门控融合
+        # 4. 门控融合（在通道汇聚后的向量上做门控）
         self.gate_fusion = GatedFusion(dim=hid_dim)
         
-        # 5. 通道注意力 (空间聚合)
-        self.channel_att = ChannelAttention(dim=hid_dim)
-        
-        # 6. 时间序列建模 (处理 30 个时间窗口)
-        self.bilstm = BiLSTM(input_dim=hid_dim, hidden_dim=hid_dim)
-        
-        # 7. 分类头 (BiLSTM 输出维度为 hid_dim * 2)
-        self.classifier = nn.Sequential(
-            nn.Linear(hid_dim * 2, 64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, num_stages)
+       # 5. Inter-Epoch 跨时间步上下文建模
+        self.context_bilstm = nn.LSTM(
+            input_size=hid_dim,
+            hidden_size=hid_dim // 2, # 双向拼接后输出维度仍为 hid_dim
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True
         )
-
-    def forward(self, x_raw):
+        
+        # 6. 最终分类器
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(hid_dim, num_stages)
+        )
+    def forward(self, x):
         """
-        Input x_raw: (B, C, 30*fs) -> 30s 信号，每通道长度应为 30*采样率
+        x: (B, seq_len, C, 30*fs) 或 (B, C, 30*fs)
+        整体流程：
+          1) 每个 epoch 独立做 TCN 特征提取 -> (B*S, C, T', D)
+          2) TAGAT / SCGAT 在通道维度上做图注意力 -> (B*S, C, hid_dim)
+          3) 对通道做聚合 + 门控融合 -> (B*S, hid_dim)
+          4) 还原为序列，BiLSTM 跨 epoch 建模 -> (B, seq_len, hid_dim)
+          5) 取中心 epoch 表征做分类
         """
-        # Step 1: 构建先验邻接矩阵 A_init (C, C)
-        A_init = self.prior_builder(x_raw) 
-        
-        # Step 2: 提取局部时空特征
-        x_feat = self.feature_extractor(x_raw) # (B, C, T=30, feature_dim)
-        B, C, T, F_dim = x_feat.shape
-        
-        # 将 Batch 和 Time 维度合并，方便 GAT 在每个时间步独立处理空间图
-        # 转置为 (B, T, C, F_dim) -> reshape (B*T, C, F_dim)
-        x_spatial = x_feat.transpose(1, 2).reshape(B * T, C, F_dim)
-        
-        # Step 3: 并行执行 TAGAT 与 SCGAT
-        h_tagat = self.tagat(x_spatial) # (B*T, C, hid_dim)
-        h_scgat, s_logits_bt = self.scgat(x_spatial, A_init) # (B*T, C, hid_dim), (B*T, num_stages)
+        # 兼容 3D 和 4D 输入：
+        # - 4D: (B, seq_len, C, L)，正常的跨 epoch 序列
+        # - 3D: (B, C, L)，则视为 seq_len=1，仅当前 epoch
+        if x.dim() == 3:
+            B, C, L = x.shape
+            S = 1
+            x = x.unsqueeze(1)          # -> (B, 1, C, L)
+        elif x.dim() == 4:
+            B, S, C, L = x.shape
+        else:
+            raise ValueError(f"SleepGATNet 期望输入为 3D 或 4D 张量，但得到 x.dim()={x.dim()}，shape={x.shape}")
 
-        # 对各个时间步的 stage 预测取平均作为辅助输出（logits）
-        s_logits = s_logits_bt.view(B, T, -1).mean(dim=1) # (B, num_stages)
-        
-        # Step 4: 门控融合
-        h_fused = self.gate_fusion(h_tagat, h_scgat) # (B*T, C, hid_dim)
-        
-        # Step 5: 通道注意力与空间聚合
-        # 为每个通道分配权重，并聚合为一个时间步的特征表示
-        h_att, att_weights = self.channel_att(h_fused) # h_att: (B*T, C, hid_dim)
-        h_space_pooled = torch.sum(h_att, dim=1)       # (B*T, hid_dim) - 空间节点收缩
-        
-        # 恢复时间序列维度 (B, T, hid_dim)
-        h_seq = h_space_pooled.view(B, T, -1)
-        
-        # Step 6: BiLSTM 建模时间序列间的依赖 (真正的时序建模)
-        h_lstm = self.bilstm(h_seq) # (B, T, hid_dim * 2)
-        
-        # Step 7: 全局时序平均池化 (GAP) 与 分类
-        h_gap = torch.mean(h_lstm, dim=1) # (B, hid_dim * 2)
-        logits = self.classifier(h_gap)   # (B, num_stages)
-        
-        # 改变 att_weights 形状以供外部可视化分析 (B, T, C, 1)
-        att_weights = att_weights.view(B, T, C, 1)
-        
-        return logits, s_logits, A_init, att_weights
+        # 展平 Batch 和 Seq 维度，以便按独立的 epoch 进行处理
+        x_flat = x.view(B * S, C, L)  # (B*S, C, T)
+
+        # --- 1. 构建通道间先验邻接矩阵（基于原始信号） ---
+        # A_prior: (C, C)，在 batch 内做平均的先验图
+        A_prior = self.prior_builder(x_flat)  # (C, C)
+
+        # --- 2. Intra-epoch TCN 特征提取 ---
+        # feature_extractor 输出: (B*S, C, T', D)
+        feat4d = self.feature_extractor(x_flat)
+        # 对时间步 T' 做聚合（这里简单取均值），得到每个通道的一个特征向量
+        feat = feat4d.mean(dim=2)  # (B*S, C, D) 作为图网络输入
+
+        # --- 3. 通道级图注意力 ---
+        # TAGAT: 仅依赖拓扑/时间先验，不用 A_prior
+        tagat_out = self.tagat(feat)              # (B*S, C, hid_dim)
+        # SCGAT: 融合结构先验 A_prior
+        scgat_out, _ = self.scgat(feat, A_prior)  # (B*S, C, hid_dim)
+
+        # --- 4. 通道聚合 + 门控融合 ---
+        # 先对通道维做平均，得到每个 epoch 的单向量
+        tagat_vec = tagat_out.mean(dim=1)         # (B*S, hid_dim)
+        scgat_vec = scgat_out.mean(dim=1)         # (B*S, hid_dim)
+        fused_feat = self.gate_fusion(tagat_vec, scgat_vec)  # (B*S, hid_dim)
+
+        # --- 5. Inter-epoch BiLSTM 跨 epoch 建模 ---
+        # 还原为 (B, seq_len, hid_dim)，seq_len 即为时间步
+        seq_feat = fused_feat.view(B, S, -1)      # (B, seq_len, hid_dim)
+        context_out, _ = self.context_bilstm(seq_feat)  # (B, seq_len, hid_dim)
+
+        # 取中心 epoch 的表征做最终分类
+        center_idx = S // 2
+        center_feat = context_out[:, center_idx, :]  # (B, hid_dim)
+
+        # --- 6. 分类输出 ---
+        logits = self.classifier(center_feat)  # (B, num_stages)
+
+        return logits
 
 
 class TCNResidualBlock(nn.Module):

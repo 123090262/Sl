@@ -134,7 +134,7 @@ def get_subject_data_dict(root_path, subject_list, channels):
             
     return data_dict
 
-def create_dataloader(data_dict, sub_ids, batch_size=16, shuffle=True, num_workers=0):
+def create_dataloader(data_dict, sub_ids, batch_size=16, shuffle=True,num_workers = 8):
     """合并受试者并创建 DataLoader (同 ISRUC)"""
     all_X = np.concatenate([data_dict[sid][0] for sid in sub_ids if sid in data_dict], axis=0)
     all_y = np.concatenate([data_dict[sid][1] for sid in sub_ids if sid in data_dict], axis=0)
@@ -143,5 +143,5 @@ def create_dataloader(data_dict, sub_ids, batch_size=16, shuffle=True, num_worke
     tensor_y = torch.tensor(all_y).long()
     
     dataset = TensorDataset(tensor_x, tensor_y)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 

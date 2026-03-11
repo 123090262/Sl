@@ -19,7 +19,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DATASET_ROOT = "E:\EEG\dataset\sleep-edf-database-expanded-1.0.0\SleepEDF-20"
 CHANNELS = ["EEG Fpz-Cz", "EEG Pz-Oz"] 
 FS = 100  
-BATCH_SIZE = 128
+BATCH_SIZE = 64
 EPOCHS = 80
 LR = 1e-4
 SAVE_DIR = "./checkpoints_edf_loso" # 修改目录名以区分
@@ -44,10 +44,30 @@ def plot_confusion_matrix(y_true, y_pred, title='Confusion Matrix', save_path=No
 def run_loso_fold(fold_idx, train_loader, test_loader):
     # 针对 Sleep-EDF 和 ISRUC 等生理信号任务
     model = SleepGATNet(channel_names=CHANNELS, fs=FS).to(DEVICE)
-    # 针对 N1 阶段准确率进行加权
-    class_weights = torch.tensor([1.0, 2.0, 1.0, 1.0, 1.0]).to(DEVICE)
+
+    # --- 动态根据训练集真实类别频率计算 Class Weights ---
+    num_classes = 5  # ['W', 'N1', 'N2', 'N3', 'REM']
+    class_counts = np.zeros(num_classes, dtype=np.float32)
+    # 直接遍历一次 train_loader 统计标签分布，兼容任意 Dataset 类型
+    for _, y_batch in train_loader:
+        y_np = y_batch.cpu().numpy().astype(np.int64)
+        class_counts += np.bincount(y_np, minlength=num_classes).astype(np.float32)
+
+    class_freq = class_counts / (class_counts.sum() + 1e-9)
+    inv_freq = 1.0 / (class_freq + 1e-9)
+    class_weights = inv_freq / inv_freq.mean()  # 归一化到均值约为 1
+    class_weights = torch.tensor(class_weights, dtype=torch.float32, device=DEVICE)
+
     criterion = nn.CrossEntropyLoss(weight=class_weights)
-    optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4) 
+
+    # --- 引入学习率调度器（基于验证集 Loss 自适应衰减）---
+    optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.5,
+        patience=3,
+    )
 
     history = {'train_loss':[], 'train_acc': [], 'val_loss': [], 'val_acc':[]}
     best_val_loss = float('inf')
@@ -61,10 +81,9 @@ def run_loso_fold(fold_idx, train_loader, test_loader):
         
         for x, y in train_loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
-           
-            
+
             optimizer.zero_grad()
-            logits, _, _, _ = model(x)
+            logits = model(x)
             loss = criterion(logits, y)
             loss.backward()
             optimizer.step()
@@ -80,7 +99,7 @@ def run_loso_fold(fold_idx, train_loader, test_loader):
         with torch.no_grad():
             for x, y in test_loader:
                 x, y = x.to(DEVICE), y.to(DEVICE)
-                logits, _, _, _ = model(x)
+                logits = model(x)
                 loss_val = criterion(logits, y)
                 val_loss += loss_val.item()
                 preds = torch.argmax(logits, dim=1)
@@ -92,6 +111,9 @@ def run_loso_fold(fold_idx, train_loader, test_loader):
         avg_val_loss = val_loss / len(test_loader)
         history['val_loss'].append(avg_val_loss)
         history['val_acc'].append(correct_val / total_val)
+
+        # 根据验证集 Loss 调整学习率
+        scheduler.step(avg_val_loss)
 
         # 早停：基于验证集 loss
         if avg_val_loss < best_val_loss - 1e-4:
@@ -118,7 +140,7 @@ def run_loso_fold(fold_idx, train_loader, test_loader):
     with torch.no_grad():
         for x, y in test_loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
-            logits, _, _, _ = model(x)
+            logits = model(x)
             probs = torch.softmax(logits, dim=1)
             preds = torch.argmax(logits, dim=1)
             
