@@ -7,108 +7,42 @@ class SleepGATNet(nn.Module):
         super(SleepGATNet, self).__init__()
         self.C = len(channel_names)
         self.fs = fs
-        self.seq_len = seq_len
-        # 1. 结构先验构建器
+        
         self.prior_builder = PriorMatrixBuilder(channel_names=channel_names)
+        self.feature_extractor = FeatureExtractor(num_channels=self.C, fs=self.fs, feature_dim=feature_dim)
         
-        # 2. 浅层 TCN 特征提取器
-        self.feature_extractor = FeatureExtractor(
-            num_channels=self.C, 
-            fs=self.fs,
-            feature_dim=feature_dim
-        )
+        # 创新点保留
+        self.tagat = TAGAT(feature_dim, hid_dim, self.C)
+        self.scgat = SCGAT(feature_dim, hid_dim, num_stages=num_stages)
         
-        # 3. 双路图注意力网络 (处理空间特征)
-        self.tagat = TAGAT(
-            in_dim=feature_dim, 
-            hid_dim=hid_dim, 
-            num_nodes=self.C
-        )
+        # 加入 LayerNorm 增加数值稳定性，防止 GAT 梯度爆炸
+        self.norm_t = nn.LayerNorm(hid_dim)
+        self.norm_s = nn.LayerNorm(hid_dim)
         
-        self.scgat = SCGAT(
-            in_channels=feature_dim, 
-            out_channels=hid_dim, 
-            stage_dim=64, 
-            num_stages=num_stages
-        )
-        
-        # 4. 门控融合（在通道汇聚后的向量上做门控）
         self.gate_fusion = GatedFusion(dim=hid_dim)
+        self.context_bilstm = nn.LSTM(hid_dim, hid_dim//2, batch_first=True, bidirectional=True)
+        self.classifier = nn.Linear(hid_dim, num_stages)
+
+    def forward(self, x, a_plv):
+        B, S, C, L = x.shape
+        x_flat = x.view(B * S, C, L)
+        a_plv_flat = a_plv.view(B * S, C, C)
+
+        A_prior = self.prior_builder(a_plv_flat)
+        feat = self.feature_extractor(x_flat) # (B*S, C, D)
+
+        # GAT 分支 + 稳定性 Norm
+        tagat_out = self.norm_t(self.tagat(feat))              
+        scgat_out, s_logits = self.scgat(feat, A_prior)
+        scgat_out = self.norm_s(scgat_out)
+
+        fused = self.gate_fusion(tagat_out.mean(1), scgat_out.mean(1))
         
-       # 5. Inter-Epoch 跨时间步上下文建模
-        self.context_bilstm = nn.LSTM(
-            input_size=hid_dim,
-            hidden_size=hid_dim // 2, # 双向拼接后输出维度仍为 hid_dim
-            num_layers=1,
-            batch_first=True,
-            bidirectional=True
-        )
+        seq_feat = fused.view(B, S, -1)
+        out, _ = self.context_bilstm(seq_feat)
         
-        # 6. 最终分类器
-        self.classifier = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Linear(hid_dim, num_stages)
-        )
-    def forward(self, x):
-        """
-        x: (B, seq_len, C, 30*fs) 或 (B, C, 30*fs)
-        整体流程：
-          1) 每个 epoch 独立做 TCN 特征提取 -> (B*S, C, T', D)
-          2) TAGAT / SCGAT 在通道维度上做图注意力 -> (B*S, C, hid_dim)
-          3) 对通道做聚合 + 门控融合 -> (B*S, hid_dim)
-          4) 还原为序列，BiLSTM 跨 epoch 建模 -> (B, seq_len, hid_dim)
-          5) 取中心 epoch 表征做分类
-        """
-        # 兼容 3D 和 4D 输入：
-        # - 4D: (B, seq_len, C, L)，正常的跨 epoch 序列
-        # - 3D: (B, C, L)，则视为 seq_len=1，仅当前 epoch
-        if x.dim() == 3:
-            B, C, L = x.shape
-            S = 1
-            x = x.unsqueeze(1)          # -> (B, 1, C, L)
-        elif x.dim() == 4:
-            B, S, C, L = x.shape
-        else:
-            raise ValueError(f"SleepGATNet 期望输入为 3D 或 4D 张量，但得到 x.dim()={x.dim()}，shape={x.shape}")
-
-        # 展平 Batch 和 Seq 维度，以便按独立的 epoch 进行处理
-        x_flat = x.view(B * S, C, L)  # (B*S, C, T)
-
-        # --- 1. 构建通道间先验邻接矩阵（基于原始信号） ---
-        # A_prior: (C, C)，在 batch 内做平均的先验图
-        A_prior = self.prior_builder(x_flat)  # (C, C)
-
-        # --- 2. Intra-epoch TCN 特征提取 ---
-        # feature_extractor 输出: (B*S, C, T', D)
-        feat4d = self.feature_extractor(x_flat)
-        # 对时间步 T' 做聚合（这里简单取均值），得到每个通道的一个特征向量
-        feat = feat4d.mean(dim=2)  # (B*S, C, D) 作为图网络输入
-
-        # --- 3. 通道级图注意力 ---
-        # TAGAT: 仅依赖拓扑/时间先验，不用 A_prior
-        tagat_out = self.tagat(feat)              # (B*S, C, hid_dim)
-        # SCGAT: 融合结构先验 A_prior
-        scgat_out, _ = self.scgat(feat, A_prior)  # (B*S, C, hid_dim)
-
-        # --- 4. 通道聚合 + 门控融合 ---
-        # 先对通道维做平均，得到每个 epoch 的单向量
-        tagat_vec = tagat_out.mean(dim=1)         # (B*S, hid_dim)
-        scgat_vec = scgat_out.mean(dim=1)         # (B*S, hid_dim)
-        fused_feat = self.gate_fusion(tagat_vec, scgat_vec)  # (B*S, hid_dim)
-
-        # --- 5. Inter-epoch BiLSTM 跨 epoch 建模 ---
-        # 还原为 (B, seq_len, hid_dim)，seq_len 即为时间步
-        seq_feat = fused_feat.view(B, S, -1)      # (B, seq_len, hid_dim)
-        context_out, _ = self.context_bilstm(seq_feat)  # (B, seq_len, hid_dim)
-
-        # 取中心 epoch 的表征做最终分类
-        center_idx = S // 2
-        center_feat = context_out[:, center_idx, :]  # (B, hid_dim)
-
-        # --- 6. 分类输出 ---
-        logits = self.classifier(center_feat)  # (B, num_stages)
-
-        return logits
+        logits = self.classifier(out[:, S//2, :])
+        return logits, s_logits
 
 
 class TCNResidualBlock(nn.Module):
@@ -119,8 +53,8 @@ class TCNResidualBlock(nn.Module):
         self.bn1 = nn.BatchNorm1d(out_channels)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(0.3)
-        # conv2 保持 stride=1，使用显式 padding 替代 'same' 避免偶数 kernel 的警告
-        padding_same = kernel_size // 2  # 与 PyTorch same 行为一致，偶数 kernel 时偏大保证不截断
+        
+        padding_same = kernel_size // 2 
         self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, 
                                stride=1, padding=padding_same, dilation=1)
         self.bn2 = nn.BatchNorm1d(out_channels)
@@ -137,9 +71,15 @@ class TCNResidualBlock(nn.Module):
         out = self.dropout(out)
         out = self.bn2(self.conv2(out))
         shortcut = self.shortcut(x)
-        # 主路径与 shortcut 可能因 stride/kernel 计算差异导致长度不同，需对齐
+        
+        # 规范化残差对齐：直接切片截断，保证相位不偏移，拒绝 pooling 强行对齐
         if shortcut.shape[-1] != out.shape[-1]:
-            shortcut = F.adaptive_avg_pool1d(shortcut, out.shape[-1])
+            diff = shortcut.shape[-1] - out.shape[-1]
+            if diff > 0:
+                shortcut = shortcut[:, :, :-diff]
+            else:
+                out = out[:, :, :shortcut.shape[-1]]
+                
         out += shortcut
         return self.relu(out)
 
@@ -177,22 +117,18 @@ class EnhancedResTCN(nn.Module):
         return self.fc(x)
 
 class FeatureExtractor(nn.Module):
-    def __init__(self, num_channels=6, fs=200, time_steps=30, feature_dim=128):
+    def __init__(self, num_channels=6, fs=100, feature_dim=128):
         super(FeatureExtractor, self).__init__()
         self.C = num_channels
         self.fs = fs
-        self.T_prime = time_steps 
         self.tcn = EnhancedResTCN(fs=self.fs, feature_dim=feature_dim)
 
     def forward(self, x):
-        B, C, T_total = x.size()
-        if T_total != self.T_prime * self.fs:
-            raise ValueError(f"输入数据长度 {T_total} 与设定 {self.T_prime}*{self.fs} 不匹配")
-            
-        x_reshaped = x.view(B, C, self.T_prime, self.fs)
-        x_batch_in = x_reshaped.view(B * C * self.T_prime, 1, self.fs)
-        features = self.tcn(x_batch_in)
-        out = features.view(B, C, self.T_prime, -1) #1
+        # x: (B*S, C, L) L 为完整的 3000 点
+        B_S, C, L = x.size()
+        x_batch_in = x.view(B_S * C, 1, L)
+        features = self.tcn(x_batch_in)  # (B_S * C, feature_dim)
+        out = features.view(B_S, C, -1)  # (B_S, C, feature_dim)
         return out
     
 class PriorMatrixBuilder(nn.Module):
@@ -209,7 +145,6 @@ class PriorMatrixBuilder(nn.Module):
             "F3-A2": [-0.4, 0.8, 0.4],      "F4-A1": [0.4, 0.8, 0.4],
             "EEG Fpz-Cz":[0.0, 0.95, 0.2],  "EEG Pz-Oz":[0.0,-0.95,0.2]  
         }
-        # 如果有通道名不在 coords 中，需添加容错机制
         pos_list = [coords.get(name, [0.0, 0.0, 0.0]) for name in channel_names]
         pos = torch.tensor(pos_list, dtype=torch.float32) 
         
@@ -219,34 +154,16 @@ class PriorMatrixBuilder(nn.Module):
         self.weight_fusion = nn.Parameter(torch.tensor([0.5, 0.5])) 
         self.E = nn.Parameter(torch.randn(self.C, self.C) * 0.01) 
 
-    def compute_plv(self, x_raw):
-        B, C, T = x_raw.shape
-        Xf = torch.fft.fft(x_raw, dim=-1)
-        h = torch.zeros(T, device=x_raw.device) 
-        if T % 2 == 0: 
-            h[0] = h[T//2] = 1 
-            h[1:T//2] = 2 
-        else:
-            h[0] = 1; h[1:(T+1)//2] = 2
+    def forward(self, A_plv):
+        # A_plv: (B*S, C, C) 取 batch 平均以获得稳定的先验
+        A_plv_mean = A_plv.mean(dim=0)
         
-        analytic_signal = torch.fft.ifft(Xf * h, dim=-1)
-        phase = torch.angle(analytic_signal) 
-        
-        phase_diff = phase.unsqueeze(2) - phase.unsqueeze(1) 
-        real_avg = torch.cos(phase_diff).mean(dim=-1)
-        imag_avg = torch.sin(phase_diff).mean(dim=-1) 
-        plv_matrix = torch.sqrt(real_avg**2 + imag_avg**2) 
-        return plv_matrix 
-
-    def forward(self, x_raw):
-        A_plv = self.compute_plv(x_raw).mean(dim=0) 
         w = torch.softmax(self.weight_fusion, dim=0)
-        A_0 = w[0] * self.A_geo + w[1] * A_plv
+        A_0 = w[0] * self.A_geo + w[1] * A_plv_mean
         
         A_init = A_0 * F.softplus(self.E) 
         A_init = (A_init + A_init.T) / 2 
         
-        # 使用 mask 替换 in-place 操作，防止反向传播报错
         mask = 1.0 - torch.eye(self.C, device=A_init.device)
         A_init = A_init * mask 
         
@@ -269,7 +186,6 @@ class SCGAT(nn.Module):
             nn.Linear(stage_dim, stage_dim)
         )
         
-        # 改用更安全的 Linear 计算注意力分数，替代复杂的 MatMul 广播
         self.att_scorer = nn.Linear(2 * self.d_k + stage_dim, 1, bias=False)
         self.lambda_prior = nn.Parameter(torch.ones(num_heads))
 
@@ -279,26 +195,23 @@ class SCGAT(nn.Module):
         
         s_logits = self.stage_mlp(x.mean(dim=1))
         s_prob = F.softmax(s_logits, dim=-1)
-        c = self.mlp_c(s_prob) # (B, stage_dim)
+        c = self.mlp_c(s_prob) 
         
-        # 显式展开维度以规避广播错误 (B, 目标节点, 源节点, 头, 特征)
         x_dst = x_proj.unsqueeze(2).expand(-1, -1, C, -1, -1) 
         x_src = x_proj.unsqueeze(1).expand(-1, C, -1, -1, -1) 
         c_rep = c.view(B, 1, 1, 1, -1).expand(-1, C, C, self.num_heads, -1)
         
-        att_input = torch.cat([x_src, x_dst, c_rep], dim=-1) # (B, C, C, H, 2*d_k + stage_dim)
-        e = F.leaky_relu(self.att_scorer(att_input).squeeze(-1), 0.2) # (B, C, C, H)
+        att_input = torch.cat([x_src, x_dst, c_rep], dim=-1) 
+        e = F.leaky_relu(self.att_scorer(att_input).squeeze(-1), 0.2) 
         
-        # 融合先验矩阵
         prior_term = self.lambda_prior.view(1, 1, 1, -1) * torch.log(A_prior.unsqueeze(0).unsqueeze(-1) + 1e-9)
         combined_e = e + prior_term
         
-        alpha = F.softmax(combined_e, dim=2) # 沿源节点(dim=2)进行 Softmax
+        alpha = F.softmax(combined_e, dim=2) 
         
-        # 注意力加权聚合
-        alpha = alpha.unsqueeze(-1) # (B, C, C, H, 1)
-        x_val = x_proj.unsqueeze(1).expand(-1, C, -1, -1, -1) # (B, C, C, H, d_k)
-        out = (alpha * x_val).sum(dim=2) # 沿源节点求和 -> (B, C, H, d_k)
+        alpha = alpha.unsqueeze(-1) 
+        x_val = x_proj.unsqueeze(1).expand(-1, C, -1, -1, -1) 
+        out = (alpha * x_val).sum(dim=2) 
         
         return out.reshape(B, C, -1), s_logits
     
@@ -317,8 +230,8 @@ class TAGAT(nn.Module):
         B, C, _ = x.shape
         x_proj = self.lin_project(x).view(B, C, self.num_heads, self.d_k)
         
-        tau = self.node_time_pos.unsqueeze(1) - self.node_time_pos.unsqueeze(0) # (C, C, 1)
-        t_enc = self.time_mlp(tau) # (C, C, t_enc_dim)
+        tau = self.node_time_pos.unsqueeze(1) - self.node_time_pos.unsqueeze(0) 
+        t_enc = self.time_mlp(tau) 
         
         x_dst = x_proj.unsqueeze(2).expand(-1, -1, C, -1, -1) 
         x_src = x_proj.unsqueeze(1).expand(-1, C, -1, -1, -1) 
