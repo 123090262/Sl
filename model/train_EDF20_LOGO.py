@@ -1,177 +1,204 @@
-import matplotlib
-import mne
-matplotlib.use('Agg') 
-import matplotlib.pyplot as plt
+import os
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import copy
-import os
-import numpy as np
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from sklearn.metrics import confusion_matrix, classification_report, cohen_kappa_score, f1_score, accuracy_score
+
+import matplotlib
+matplotlib.use('Agg') # 保证在无显示器服务器上运行
+import matplotlib.pyplot as plt
 import seaborn as sns
 
-from torch.utils.tensorboard import SummaryWriter
-from sklearn.metrics import confusion_matrix, classification_report, cohen_kappa_score, roc_auc_score
+from model import SleepGATNet
+from SleepEDFdataset import get_data_dict, SeqSleepDataset
 
-# 导入你定义的模型和数据处理脚本
-from model import SleepGATNet 
-from SleepEDFdataset import get_subject_data_dict, create_dataloader
+# ==========================================
+# 1. 核心配置
+# ==========================================
+CONFIG = {
+    "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    "dataset_root": r"E:\EEG\dataset\sleep-edf-database-expanded-1.0.0\SleepEDF-20",
+    "channels": ["EEG Fpz-Cz", "EEG Pz-Oz", "EOG horizontal"],
+    "fs": 100,
+    "batch_size": 32, 
+    "epochs": 60,
+    "lr": 2e-4,           # 较低起步，配合余弦退火
+    "weight_decay": 1e-3, 
+    "patience": 8,       # 早停耐心值
+    "seq_len": 21,        # 捕捉长程上下文
+    "save_dir": "./checkpoints_loso_edf20",
+    "log_dir": "./runs/sleep_gat_final"
+}
 
-# --- 1. 配置参数 ---
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-DATASET_ROOT = r"E:\EEG\dataset\sleep-edf-database-expanded-1.0.0\SleepEDF-20"
-CHANNELS = ["EEG Fpz-Cz", "EEG Pz-Oz"] 
-FS = 100  
-BATCH_SIZE = 64
-EPOCHS = 50
-LR = 1e-4
-SAVE_DIR = "./checkpoints_edf_loso"
-LOG_DIR = os.path.join(SAVE_DIR, "tensorboard_logs")
-os.makedirs(SAVE_DIR, exist_ok=True)
-
-# --- 2. 辅助函数 ---
-def plot_confusion_matrix(y_true, y_pred, title='Confusion Matrix', save_path=None):
+# ==========================================
+# 2. 增强型评估与绘图函数
+# ==========================================
+def plot_final_confusion_matrix(y_true, y_pred, save_path):
     class_names = ['W', 'N1', 'N2', 'N3', 'REM']
-    cm = confusion_matrix(y_true, y_pred, labels=range(len(class_names)))
+    cm = confusion_matrix(y_true, y_pred, labels=range(5))
+    # 归一化显示百分比
     cm_percent = cm.astype('float') / (cm.sum(axis=1)[:, np.newaxis] + 1e-9) * 100
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(cm_percent, annot=True, fmt='.2f', cmap='Greens',
+    
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(cm_percent, annot=True, fmt='.2f', cmap='Blues',
                 xticklabels=class_names, yticklabels=class_names)
-    plt.title(title)
-    plt.xlabel('Predicted')
-    plt.ylabel('True')
-    if save_path: plt.savefig(save_path, dpi=300)
-    plt.close()
+    plt.title('Global Confusion Matrix (20 Subjects Overall) [%]')
+    plt.xlabel('Predicted Stage')
+    plt.ylabel('True Stage')
+    plt.savefig(save_path, dpi=300)
+    plt.close() # 彻底释放内存
 
-# --- 3. 核心训练函数 ---
-def run_loso_fold(fold_idx, train_loader, test_loader, sub_name):
-    # 为当前受试者创建 TensorBoard 记录器
-    writer = SummaryWriter(log_dir=os.path.join(LOG_DIR, sub_name))
-    
-    model = SleepGATNet(channel_names=CHANNELS, fs=FS).to(DEVICE)
-
-    # 动态计算类别权重以应对数据不平衡
-    num_classes = 5
-    class_counts = np.zeros(num_classes, dtype=np.float32)
-    for _, y_batch, _ in train_loader:
-        class_counts += np.bincount(y_batch.numpy().astype(np.int64), minlength=num_classes)
-    
-    class_weights = 1.0 / (class_counts / class_counts.sum() + 1e-9)
-    class_weights = torch.tensor(class_weights / class_weights.mean(), dtype=torch.float32, device=DEVICE)
-    
-    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
-    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-3) # 增大 weight_decay 抑制过拟合
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
-
-    best_val_loss = float('inf')
-    best_state = None
-    patience, no_improve = 10, 0
-    global_step = 0
-
-    for epoch in range(EPOCHS):
-        # --- 训练阶段 ---
-        model.train()
-        train_loss, correct_train, total_train = 0.0, 0, 0
-        
-        for x, y, a_plv in train_loader:
-            x, y, a_plv = x.to(DEVICE), y.to(DEVICE), a_plv.to(DEVICE)
-            optimizer.zero_grad()
-            
-            logits, _ = model(x, a_plv)  # SleepGATNet 返回 (logits, s_logits)
-            loss = criterion(logits, y)
-            
-            if torch.isnan(loss):
-                print(f"Warning: NaN loss detected in {sub_name}, skipping batch.")
-                continue
-                
-            loss.backward()
-            
-            # 监控并防止梯度爆炸：梯度裁剪
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            writer.add_scalar('Train/Gradient_Norm', grad_norm, global_step)
-            writer.add_scalar('Train/Batch_Loss', loss.item(), global_step)
-            
-            optimizer.step()
-            
-            train_loss += loss.item()
-            correct_train += (torch.argmax(logits, dim=1) == y).sum().item()
-            total_train += y.size(0)
-            global_step += 1
-            
-        # --- 验证阶段 ---
-        model.eval()
-        val_loss, correct_val, total_val = 0.0, 0, 0
-        with torch.no_grad():
-            for x, y, a_plv in test_loader:
-                x, y, a_plv = x.to(DEVICE), y.to(DEVICE), a_plv.to(DEVICE)
-                logits, _ = model(x, a_plv)
-                val_loss += criterion(logits, y).item()
-                correct_val += (torch.argmax(logits, dim=1) == y).sum().item()
-                total_val += y.size(0)
-
-        # 计算指标
-        avg_train_loss = train_loss / len(train_loader)
-        avg_val_loss = val_loss / len(test_loader)
-        train_acc = correct_train / total_train
-        val_acc = correct_val / total_val
-
-        # 将指标写入 TensorBoard 观察过拟合
-        writer.add_scalar('Epoch/Loss_Train', avg_train_loss, epoch)
-        writer.add_scalar('Epoch/Loss_Val', avg_val_loss, epoch)
-        writer.add_scalar('Epoch/Acc_Train', train_acc, epoch)
-        writer.add_scalar('Epoch/Acc_Val', val_acc, epoch)
-        writer.add_scalar('Train/Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
-
-        scheduler.step(avg_val_loss)
-
-        if avg_val_loss < best_val_loss - 1e-4:
-            best_val_loss, best_state, no_improve = avg_val_loss, copy.deepcopy(model.state_dict()), 0
+class EarlyStopping:
+    def __init__(self, patience=10, path='checkpoint.pt'):
+        self.patience, self.counter, self.best_score, self.early_stop, self.path = patience, 0, None, False, path
+    def __call__(self, val_acc, model):
+        if self.best_score is None or val_acc > self.best_score:
+            self.best_score, self.counter = val_acc, 0
+            torch.save(model.state_dict(), self.path)
         else:
-            no_improve += 1
+            self.counter += 1
+            if self.counter >= self.patience: self.early_stop = True
 
-        if (epoch + 1) % 5 == 0:
-            print(f"Sub {sub_name} | Ep {epoch+1} | Train Loss: {avg_train_loss:.3f} | Val Acc: {val_acc:.4f}")
-
-        if no_improve >= patience: break
-
-    if best_state: model.load_state_dict(best_state)
+# ==========================================
+# 3. LOSO 训练主程序
+# ==========================================
+def train_loso():
+    os.makedirs(CONFIG["save_dir"], exist_ok=True)
     
-    # 最终测试获取预测结果
-    y_true_f, y_pred_f, y_prob_f = [], [], []
-    model.eval()
-    with torch.no_grad():
-        for x, y, a_plv in test_loader:
-            x, y, a_plv = x.to(DEVICE), y.to(DEVICE), a_plv.to(DEVICE)
-            logits, _ = model(x, a_plv)
-            y_true_f.extend(y.cpu().numpy())
-            y_pred_f.extend(torch.argmax(logits, dim=1).cpu().numpy())
-            y_prob_f.extend(torch.softmax(logits, dim=1).cpu().numpy())
+    # A. 数据加载
+    print(">>> 正在初始化受试者数据...")
+    sub_list = sorted({f[:5] for f in os.listdir(CONFIG["dataset_root"]) if "PSG.edf" in f})[:20]
+    data_dict, P_matrix, _ = get_data_dict(CONFIG["dataset_root"], sub_list, CONFIG["channels"])
+    P_matrix = P_matrix.to(CONFIG["device"])
+    
+    # 损失函数：给 N1 分配 4 倍权重，W/N2 适当降低
+    class_weights = torch.tensor([1.0, 4.0, 0.7, 1.2, 1.2]).to(CONFIG["device"])
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-    writer.close()
-    return np.array(y_true_f), np.array(y_pred_f), np.array(y_prob_f), model
+    # 用于存放所有人的总结果
+    global_y_true, global_y_pred = [], []
+    # 用于存放每个受试者的指标
+    subject_results = []
 
-# --- 4. 主程序 ---
+    # B. 20折 LOSO
+    for fold, test_sub in enumerate(sub_list):
+        print(f"\n{'#'*15} FOLD {fold+1}/20: Testing Subject {test_sub} {'#'*15}")
+        
+        train_subs = [s for s in sub_list if s != test_sub]
+        train_set = SeqSleepDataset(data_dict, train_subs, seq_len=CONFIG["seq_len"])
+        test_set = SeqSleepDataset(data_dict, [test_sub], seq_len=CONFIG["seq_len"])
+        
+        train_loader = DataLoader(train_set, batch_size=CONFIG["batch_size"], shuffle=True)
+        test_loader = DataLoader(test_set, batch_size=CONFIG["batch_size"])
+
+        # 初始化模型
+        model = SleepGATNet(channel_names=CONFIG["channels"], fs=CONFIG["fs"]).to(CONFIG["device"])
+        optimizer = optim.AdamW(model.parameters(), lr=CONFIG["lr"], weight_decay=CONFIG["weight_decay"])
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG["epochs"])
+        writer = SummaryWriter(os.path.join(CONFIG["log_dir"], f"fold_{test_sub}"))
+        
+        save_path = os.path.join(CONFIG["save_dir"], f"best_{test_sub}.pt")
+        early_stopping = EarlyStopping(patience=CONFIG["patience"], path=save_path)
+
+        for epoch in range(CONFIG["epochs"]):
+            model.train()
+            total_loss, grad_norms = 0.0, []
+            
+            for x, y, a_fc in train_loader:
+                x, y, a_fc = x.to(CONFIG["device"]), y.to(CONFIG["device"]), a_fc.to(CONFIG["device"])
+                optimizer.zero_grad()
+                
+                # forward: 得到主预测 logits 和 TRGAT 辅助 logits
+                logits, _, _ = model(x, a_fc, P_matrix)
+                
+                # 计算损失 (主损失 + 辅助损失)
+                loss = criterion(logits[:, CONFIG["seq_len"]//2, :], y)
+
+                
+                loss.backward()
+                
+                # 梯度裁剪与监控
+                gnorm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                grad_norms.append(gnorm.item())
+                
+                optimizer.step()
+                total_loss += loss.item()
+            
+            # 记录 TensorBoard
+            writer.add_scalar('Loss/Train', total_loss/len(train_loader), epoch)
+            writer.add_scalar('Gradient/MaxNorm', np.max(grad_norms), epoch)
+
+            # 在当前测试受试者上跑一遍验证
+            model.eval()
+            correct, v_total = 0, 0
+            with torch.no_grad():
+                for vx, vy, va_fc in test_loader:
+                    vx, vy, va_fc = vx.to(CONFIG["device"]), vy.to(CONFIG["device"]), va_fc.to(CONFIG["device"])
+                    out, _, _ = model(vx, va_fc, P_matrix)
+                    pred = out[:, CONFIG["seq_len"]//2, :].argmax(dim=1)
+                    correct += (pred == vy).sum().item()
+                    v_total += vy.size(0)
+            
+            val_acc = correct / v_total
+            writer.add_scalar('Acc/TestSub', val_acc, epoch)
+            scheduler.step()
+            
+            if (epoch+1) % 5 == 0:
+                print(f"  Epoch {epoch+1:02d} | Loss: {total_loss/len(train_loader):.4f} | Acc: {val_acc:.4f}")
+            
+            early_stopping(val_acc, model)
+            if early_stopping.early_stop: break
+
+        # C. 统计单人战果
+        model.load_state_dict(torch.load(save_path))
+        model.eval()
+        f_true, f_pred = [], []
+        with torch.no_grad():
+            for tx, ty, ta_fc in test_loader:
+                tx, ty, ta_fc = tx.to(CONFIG["device"]), ty.to(CONFIG["device"]), ta_fc.to(CONFIG["device"])
+                out, _, _ = model(tx, ta_fc, P_matrix)
+                pred = out[:, CONFIG["seq_len"]//2, :].argmax(dim=1)
+                f_true.extend(ty.cpu().numpy()); f_pred.extend(pred.cpu().numpy())
+        
+        # 计算该受试者的核心指标
+        f_acc = accuracy_score(f_true, f_pred)
+        f_f1 = f1_score(f_true, f_pred, average='macro')
+        f_kappa = cohen_kappa_score(f_true, f_pred)
+        
+        subject_results.append({
+            "Subject": test_sub,
+            "Accuracy": f_acc,
+            "Macro-F1": f_f1,
+            "Kappa": f_kappa
+        })
+        
+        global_y_true.extend(f_true)
+        global_y_pred.extend(f_pred)
+        writer.close()
+
+    # ==========================================
+    # 4. 打印“成绩单”表格与最终热力图
+    # ==========================================
+    df = pd.DataFrame(subject_results)
+    print("\n" + "="*60)
+    print("SUBJECT-WISE PERFORMANCE TABLE")
+    print("="*60)
+    print(df.to_string(index=False))
+    df.to_csv(os.path.join(CONFIG["save_dir"], "subject_metrics.csv"), index=False)
+    
+    print("\n" + "="*60)
+    print("GLOBAL CLASSIFICATION REPORT")
+    print("="*60)
+    print(classification_report(global_y_true, global_y_pred, target_names=['W', 'N1', 'N2', 'N3', 'REM']))
+    
+    # 最终绘图
+    plot_final_confusion_matrix(global_y_true, global_y_pred, os.path.join(CONFIG["save_dir"], "final_global_cm.png"))
+
 if __name__ == "__main__":
-    subjects = [f"SC4{i:02d}" for i in range(20)] 
-    # 此处调用需配合你在上一步修改过的、支持受试者级归一化的 get_subject_data_dict
-    all_data = get_subject_data_dict(DATASET_ROOT, subjects, CHANNELS)
+    train_loso()
 
-    all_y_true, all_y_pred, all_y_prob = [], [], []
 
-    for i, test_sub in enumerate(subjects):
-        train_subs = [s for s in subjects if s != test_sub]
-        print(f"\n>>>> Fold {i+1}/20 | Test Subject: {test_sub}")
-        
-        train_loader = create_dataloader(all_data, train_subs, batch_size=BATCH_SIZE)
-        test_loader = create_dataloader(all_data, [test_sub], batch_size=BATCH_SIZE, shuffle=False)
-        
-        y_true, y_pred, y_prob, trained_model = run_loso_fold(i+1, train_loader, test_loader, test_sub)
-        
-        torch.save(trained_model.state_dict(), os.path.join(SAVE_DIR, f"model_{test_sub}.pth"))
-        
-        all_y_true.extend(y_true); all_y_pred.extend(y_pred); all_y_prob.extend(y_prob)
-
-    # 最终统计
-    print("\n" + "="*30 + " FINAL RESULTS " + "="*30)
-    print(classification_report(all_y_true, all_y_pred, target_names=['W', 'N1', 'N2', 'N3', 'REM'], digits=4))
-    plot_confusion_matrix(all_y_true, all_y_pred, save_path=f'{SAVE_DIR}/final_cm.png')

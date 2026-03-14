@@ -7,210 +7,186 @@ from scipy.signal import butter, filtfilt
 import mne
 from mne.decoding import Scaler
 
-# --- 1. 单个受试者/记录读取与预处理 ---
+# --- 统计工具 ---
+def calculate_transition_matrix(all_labels):
+    P = np.zeros((5, 5))
+    for labels in all_labels:
+        for i in range(len(labels) - 1):
+            curr, nxt = labels[i], labels[i+1]
+            if 0 <= curr < 5 and 0 <= nxt < 5:
+                P[curr, nxt] += 1
+    P_prob = P / (P.sum(axis=1, keepdims=True) + 1e-9)
+    return torch.tensor(P_prob, dtype=torch.float32)
 
-def compute_plv_offline(x_raw):
-    """
-    预计算整晚数据的 PLV 矩阵。
-    x_raw: numpy array (N, C, T)
-    返回: numpy array (N, C, C)
-    """
-    # 避免负 stride 的 numpy 视图导致 torch 报错，先拷贝为连续数组
-    if not isinstance(x_raw, np.ndarray):
-        x_raw = np.array(x_raw)
-    x_raw = np.ascontiguousarray(x_raw)
-    x_tensor = torch.from_numpy(x_raw.astype(np.float32, copy=False))
-    N, C, T = x_tensor.shape
-    Xf = torch.fft.fft(x_tensor, dim=-1)
-    h = torch.zeros(T, device=x_tensor.device) 
-    
-    if T % 2 == 0: 
-        h[0] = h[T//2] = 1 
-        h[1:T//2] = 2 
-    else:
-        h[0] = 1; h[1:(T+1)//2] = 2
-    
-    analytic_signal = torch.fft.ifft(Xf * h, dim=-1)
-    phase = torch.angle(analytic_signal) 
-    
-    phase_diff = phase.unsqueeze(2) - phase.unsqueeze(1) 
-    real_avg = torch.cos(phase_diff).mean(dim=-1)
-    imag_avg = torch.sin(phase_diff).mean(dim=-1) 
-    plv_matrix = torch.sqrt(real_avg**2 + imag_avg**2) 
-    return plv_matrix.numpy()
+def compute_fcMatrix(X_scaled):
+    C = X_scaled.shape[1]
+    X_flat = X_scaled.transpose(1, 0, 2).reshape(C, -1)
+    fc_matrix = np.corrcoef(X_flat)
+    return np.abs(fc_matrix).astype(np.float32)
 
-def load_edf_record(psg_path, hyp_path, channels=["EEG Fpz-Cz", "EEG Pz-Oz"]):
+# --- 核心加载与预处理 (增加 N1 重叠滑窗) ---
+def load_edf_subject(psg_path, hyp_path, channels, n1_aug_stride=15):
     """
-    读取单条记录，执行双端 W 裁剪，并剔除 Unknown/无效标签
+    n1_aug_stride: N1 阶段的滑动步长（秒）。若为 5，则每个 30s 的 N1 会生成 30/5 = 6 个样本。
     """
     try:
-        psg_edf = EdfReader(psg_path)
-        all_labels = psg_edf.getSignalLabels()
-        fs = int(psg_edf.getSampleFrequency(0))
-        idx = [all_labels.index(ch) for ch in channels]
-        signals = [psg_edf.readSignal(i) for i in idx]
-        psg_edf._close()
-        X = np.vstack(signals) 
-    except Exception as e:
-        print(f"读取信号出错 {psg_path}: {e}")
-        return None, None, None
-
-    try:
-        hyp_edf = EdfReader(hyp_path)
-        annotations = hyp_edf.readAnnotations()
-        hyp_edf._close()
+        psg = EdfReader(psg_path)
+        all_ch = psg.getSignalLabels()
+        fs = int(psg.getSampleFrequency(0))
+        indices = [all_ch.index(ch) for ch in channels]
+        signals = np.vstack([psg.readSignal(i) for i in indices])
+        psg._close()
+        X_raw = signals
         
-        epoch_len = 30 * fs
-        num_epochs = X.shape[1] // epoch_len
+        hyp = EdfReader(hyp_path)
+        ann = hyp.readAnnotations()
+        hyp._close()
+        
+        epoch_samples = 30 * fs
+        num_epochs = X_raw.shape[1] // epoch_samples
         labels = np.full((num_epochs,), -1, dtype=int)
         
-        label_map = {
-            'Sleep stage W': 0,
-            'Sleep stage 1': 1,
-            'Sleep stage 2': 2,
-            'Sleep stage 3': 3,
-            'Sleep stage 4': 3,
-            'Sleep stage R': 4
-        }
+        label_map = {'Sleep stage W': 0, 'Sleep stage 1': 1, 'Sleep stage 2': 2, 
+                     'Sleep stage 3': 3, 'Sleep stage 4': 3, 'Sleep stage R': 4}
         
-        for onset, duration, desc in zip(annotations[0], annotations[1], annotations[2]):
+        for onset, duration, desc in zip(ann[0], ann[1], ann[2]):
             if desc in label_map:
                 start_epoch = int(onset // 30)
                 n_epochs = int(duration // 30)
                 end_epoch = min(start_epoch + n_epochs, num_epochs)
                 labels[start_epoch:end_epoch] = label_map[desc]
 
-        # --- 双端 W 裁剪逻辑 ---
-        sleep_indices = np.where((labels > 0))[0]
-        
-        if len(sleep_indices) > 0:
-            first_sleep = sleep_indices[0]
-            last_sleep = sleep_indices[-1]
+        # 双端 W 裁剪
+        sleep_idx = np.where((labels > 0))[0]
+        if len(sleep_idx) > 0:
             buffer = 60 
-            
-            start_idx = max(0, first_sleep - buffer)
-            end_idx = min(num_epochs, last_sleep + buffer + 1)
-            
-            X = X[:, start_idx * epoch_len : end_idx * epoch_len]
+            start_idx = max(0, sleep_idx[0] - buffer)
+            end_idx = min(num_epochs, sleep_idx[-1] + buffer + 1)
+            X_raw = X_raw[:, start_idx * epoch_samples : end_idx * epoch_samples]
             labels = labels[start_idx : end_idx]
-        
-        # --- 剔除 Unknown 和无效标签 ---
-        valid_idx = np.where(labels != -1)[0]
-        X_final = []
-        for i in valid_idx:
-            X_final.append(X[:, i*epoch_len : (i+1)*epoch_len])
-            
-        return np.array(X_final).astype(np.float32), labels[valid_idx], fs
-        
-    except Exception as e:
-        print(f"解析标签出错 {hyp_path}: {e}")
-        return None, None, None
 
-def sleep_bandpass(data, fs, lowcut=0.3, highcut=35.0, order=4):
-    """带通滤波 (同 ISRUC)"""
+        # 记录原始统计量（剔除 Unknown 后的纯净样本）
+        valid_mask = (labels != -1)
+        original_y = labels[valid_mask]
+        
+        # 执行增强切片
+        X_final = []
+        y_final = []
+        
+        current_valid_indices = np.where(valid_mask)[0]
+        for idx in current_valid_indices:
+            label = labels[idx]
+            start_s = idx * epoch_samples
+            
+            # 基础样本
+            X_final.append(X_raw[:, start_s : start_s + epoch_samples])
+            y_final.append(label)
+            
+            # N1 增强：如果当前是 N1，且不是最后一个 epoch（防止越界）
+            if label == 1 and (start_s + epoch_samples + fs * n1_aug_stride <= X_raw.shape[1]):
+                # 以 n1_aug_stride 为步长进行重叠采样
+                # 例如 30s 窗口，5s 步长，增加 5 个重叠样本
+                for offset_sec in range(n1_aug_stride, 30, n1_aug_stride):
+                    offset_tick = offset_sec * fs
+                    if start_s + offset_tick + epoch_samples <= X_raw.shape[1]:
+                        X_final.append(X_raw[:, start_s + offset_tick : start_s + offset_tick + epoch_samples])
+                        y_final.append(1)
+
+        return np.array(X_final).astype(np.float32), np.array(y_final), original_y, fs
+    
+    except Exception as e:
+        print(f"Error loading {psg_path}: {e}")
+        return None, None, None, None
+
+def apply_custom_filter(X, fs):
     nyq = 0.5 * fs
-    b, a = butter(order, [lowcut/nyq, highcut/nyq], btype='band')
-    return filtfilt(b, a, data, axis=-1)
+    b1, a1 = butter(4, [0.5/nyq, 35.0/nyq], btype='band')
+    X[:, 0:2, :] = filtfilt(b1, a1, X[:, 0:2, :], axis=-1)
+    b2, a2 = butter(4, [0.3/nyq, 10.0/nyq], btype='band')
+    X[:, 2, :] = filtfilt(b2, a2, X[:, 2, :], axis=-1)
+    return X
 
 def apply_subject_scaler_mne(X_sub, fs, channels):
-    """
-    使用 MNE 对受试者的所有数据（通常是两晚）进行通道级 z-score 归一化
-    X_sub: numpy array (Total_Epochs, C, T)
-    """
-    # 1. 构建 MNE Info 对象
-    # 根据你的 CHANNELS 确定类型，Sleep-EDF 通常是 eeg 或 eog
-    ch_types = ['eeg'] * len(channels)
+    ch_types = ["eeg", "eeg", "eog"]
     info = mne.create_info(ch_names=channels, sfreq=fs, ch_types=ch_types)
+    scaler = Scaler(info=info, scalings="mean")
+    return scaler.fit_transform(X_sub).astype(np.float32)
     
-    # 2. 使用 mne.decoding.Scaler
-    # scalings='std' 对应 z-score ( (x - mean) / std )
-    # 它会针对每个 channel 计算所有 epoch 的统计量
-    scaler = Scaler(info=info, scalings='std')
-    
-    # Scaler 期望输入为 (n_epochs, n_channels, n_times)
-    X_scaled = scaler.fit_transform(X_sub)
-    
-    return X_scaled.astype(np.float32)
-
-# --- 2. 数据组织函数 ---
-
-def get_subject_data_dict(root_path, subject_list, channels):
+def get_data_dict(root, sub_list, channels):
     data_dict = {}
-    all_files = os.listdir(root_path)
-    
-    for sub_id in subject_list:
+    all_training_labels = [] 
+    original_labels_all = [] # 用于最终统计原有样本量
+    all_files = os.listdir(root)
+
+    for sub_id in sub_list:
         psg_files = sorted([f for f in all_files if f.startswith(sub_id) and f.endswith("PSG.edf")])
+        sub_raw_X, sub_raw_y, sub_fs = [], [], None
         
-        all_x_raw_sub = [] # 存储未归一化的原始信号
-        all_y_sub = []
-        
-        # 第一步：先加载该受试者所有的夜晚数据
         for psg_f in psg_files:
-            file_prefix = psg_f[:6]
+            file_prefix = psg_f[:6]                    
             hyp_f = [f for f in all_files if f.startswith(file_prefix) and f.endswith("Hypnogram.edf")]
-            
-            if len(hyp_f) > 0:
-                psg_path = os.path.join(root_path, psg_f)
-                hyp_path = os.path.join(root_path, hyp_f[0])
-                
-                # 注意：修改 load_edf_record，内部不再调用 apply_scaler
-                X, y, fs = load_edf_record(psg_path, hyp_path, channels=channels)
-                
+            if hyp_f:
+                X, y, orig_y, fs = load_edf_subject(os.path.join(root, psg_f), os.path.join(root, hyp_f[0]), channels)
                 if X is not None:
-                    # 只做基础带通滤波，不做归一化
-                    X = sleep_bandpass(X, fs)
-                    all_x_raw_sub.append(X)
-                    all_y_sub.append(y)
+                    sub_raw_X.append(X)
+                    sub_raw_y.append(y)
+                    original_labels_all.append(orig_y) # 记录原始标签
+                    sub_fs = fs
+        
+        if sub_raw_X:
+            X_combined = np.concatenate(sub_raw_X, axis=0)
+            Y_combined = np.concatenate(sub_raw_y, axis=0)
+            X_filtered = apply_custom_filter(X_combined, sub_fs)
+            X_scaled = apply_subject_scaler_mne(X_filtered, sub_fs, channels)
+            A_fc = compute_fcMatrix(X_scaled)
+            
+            data_dict[sub_id] = (X_scaled, Y_combined, A_fc)
+            all_training_labels.append(Y_combined)
+            print(f"Loaded {sub_id}, original epoch: {len(np.concatenate(original_labels_all[-len(sub_raw_X):]))}, augmented total: {len(Y_combined)}")
 
-        # 第二步：如果该受试者有数据，合并后进行受试者级归一化
-        if len(all_x_raw_sub) > 0:
-            X_combined = np.concatenate(all_x_raw_sub, axis=0) # (Total_Epochs, C, T)
-            Y_combined = np.concatenate(all_y_sub, axis=0)
-            
-            # 使用 MNE 进行受试者级归一化
-            X_scaled = apply_subject_scaler_mne(X_combined, fs, channels)
-            
-            # 第三步：归一化后再计算 PLV（保证相位特征的提取基于标准化信号，更稳定）
-            A_plv = compute_plv_offline(X_scaled)
-            
-            data_dict[sub_id] = (X_scaled, Y_combined, A_plv.astype(np.float32))
-            print(f"Loaded Subject {sub_id} | Subject-wise Scaled | Total Epochs: {len(Y_combined)}")
-            
-    return data_dict
+    P_matrix = calculate_transition_matrix(all_training_labels)
+    # 将汇总的原始标签合并为一个数组返回，用于最后的统计
+    y_orig_total = np.concatenate(original_labels_all, axis=0) if original_labels_all else np.array([])
+    return data_dict, P_matrix, y_orig_total
 
+# --- Dataset 类保持不变 ---
 class SeqSleepDataset(Dataset):
-    def __init__(self, X, y, A_plv, seq_len=5):
-        self.X = X
-        self.y = y
-        self.A_plv = A_plv
+    def __init__(self, data_dict, sub_ids, seq_len=5):
+        self.X = np.concatenate([data_dict[i][0] for i in sub_ids], axis=0)
+        self.y = np.concatenate([data_dict[i][1] for i in sub_ids], axis=0)
+        self.A = np.concatenate([np.repeat(data_dict[i][2][np.newaxis,...], len(data_dict[i][1]), axis=0) for i in sub_ids], axis=0)
         self.seq_len = seq_len
-        self.pad_len = seq_len // 2
-        
-        # 信号和 PLV 矩阵同步 Padding
-        self.X_padded = np.pad(self.X, ((self.pad_len, self.pad_len), (0, 0), (0, 0)), mode='constant')
-        self.A_plv_padded = np.pad(self.A_plv, ((self.pad_len, self.pad_len), (0, 0), (0, 0)), mode='constant')
-        
-    def __len__(self):
-        return len(self.y)
-    
-    def __getitem__(self, idx):
-        return (torch.FloatTensor(self.X_padded[idx:idx+self.seq_len]), 
-                torch.LongTensor([self.y[idx]])[0], 
-                torch.FloatTensor(self.A_plv_padded[idx:idx+self.seq_len]))
-def create_dataloader(data_dict, sub_ids, batch_size=16, shuffle=True, num_workers=0, seq_len=5):
-    """合并受试者并创建支持时序上下文的 DataLoader"""
-    all_X = np.concatenate([data_dict[sid][0] for sid in sub_ids if sid in data_dict], axis=0)
-    all_y = np.concatenate([data_dict[sid][1] for sid in sub_ids if sid in data_dict], axis=0)
-    all_aplv = np.concatenate([data_dict[sid][2] for sid in sub_ids if sid in data_dict], axis=0)
-    
-    dataset = SeqSleepDataset(all_X, all_y, all_aplv, seq_len=seq_len)
-    
-    loader = DataLoader(
-        dataset, 
-        batch_size=batch_size, 
-        shuffle=shuffle, 
-        num_workers=num_workers,
-        drop_last=False
-    )
-    return loader
+        self.pad = seq_len // 2
+        self.X_pad = np.pad(self.X, ((self.pad, self.pad), (0,0), (0,0)), mode='constant')
+        self.A_pad = np.pad(self.A, ((self.pad, self.pad), (0,0), (0,0)), mode='constant')
 
+    def __len__(self): return len(self.y)
+    def __getitem__(self, i):
+        return (torch.from_numpy(self.X_pad[i:i+self.seq_len]), 
+                torch.tensor(self.y[i], dtype=torch.long), 
+                torch.from_numpy(self.A_pad[i:i+self.seq_len]))
+
+if __name__ == "__main__":
+    root = r"E:\EEG\dataset\sleep-edf-database-expanded-1.0.0\SleepEDF-20" 
+    stage_names = ["W", "N1", "N2", "N3", "REM"]
+    sub_list = sorted({f[:5] for f in os.listdir(root) if "PSG.edf" in f})[:20]
+
+    # y_orig_total 返回的是未经过重叠滑窗增强的原始样本统计
+    data_dict, P_matrix, y_orig_total = get_data_dict(root, sub_list, channels=["EEG Fpz-Cz", "EEG Pz-Oz", "EOG horizontal"])
+
+    print("\n--- 原始样本数统计 (未增强前) ---")
+    for i, name in enumerate(stage_names):
+        print(f"{name}: {int((y_orig_total == i).sum())}")
+    print(f"Total Original: {len(y_orig_total)}")
+
+    print("\n--- 训练/测试实际使用的样本数 (含 N1 增强) ---")
+    y_aug_total = np.concatenate([v[1] for v in data_dict.values()], axis=0)
+    for i, name in enumerate(stage_names):
+        print(f"{name}: {int((y_aug_total == i).sum())}")
+    print(f"Total Augmented: {len(y_aug_total)}")
+
+    print("\n转移概率矩阵 P (基于增强后的序列计算，以匹配训练逻辑)")
+    P = P_matrix.cpu().numpy()
+    print("      " + "  ".join([f"{n:>6s}" for n in stage_names]))
+    for i, row_name in enumerate(stage_names):
+        print(f"{row_name:>4s}  " + "  ".join([f'{P[i, j]:6.4f}' for j in range(5)]))

@@ -3,46 +3,58 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class SleepGATNet(nn.Module):
-    def __init__(self, channel_names, fs=100, num_stages=5, feature_dim=128, hid_dim=256, seq_len=5):
+    def __init__(self, channel_names, fs=100, num_stages=5, feature_dim=128, hid_dim=256):
         super(SleepGATNet, self).__init__()
         self.C = len(channel_names)
-        self.fs = fs
         
-        self.prior_builder = PriorMatrixBuilder(channel_names=channel_names)
-        self.feature_extractor = FeatureExtractor(num_channels=self.C, fs=self.fs, feature_dim=feature_dim)
+        # 基础 TCN 提取
+        self.tcn = EnhancedResTCN(fs=fs, feature_dim=feature_dim)
         
-        # 创新点保留
-        self.tagat = TAGAT(feature_dim, hid_dim, self.C)
-        self.scgat = SCGAT(feature_dim, hid_dim, num_stages=num_stages)
+        # 双通道注意力
+        self.mcgat = MCGAT(feature_dim, hid_dim, num_heads=4, num_channels=self.C)
+        self.trgat = TRGAT(feature_dim, hid_dim, num_heads=4, num_stages=num_stages)
         
-        # 加入 LayerNorm 增加数值稳定性，防止 GAT 梯度爆炸
-        self.norm_t = nn.LayerNorm(hid_dim)
-        self.norm_s = nn.LayerNorm(hid_dim)
+        self.norm = nn.LayerNorm(hid_dim)
+        self.fusion = GatedFusion(hid_dim)
         
-        self.gate_fusion = GatedFusion(dim=hid_dim)
-        self.context_bilstm = nn.LSTM(hid_dim, hid_dim//2, batch_first=True, bidirectional=True)
+        # 【跨 Epoch 记忆】：BiLSTM
+        self.bilstm = nn.LSTM(hid_dim, hid_dim // 2, batch_first=True, bidirectional=True)
         self.classifier = nn.Linear(hid_dim, num_stages)
 
-    def forward(self, x, a_plv):
+    def forward(self, x, A_fc, P_matrix, hidden=None):
+        """
+        x: (B, S, C, L) -> (Batch, Seq, Chan, Len)
+        A_fc: (B, S, C, C)
+        P_matrix: (5, 5) 全局统计矩阵
+        hidden: 传入 (h, c) 用于跨 Epoch 记忆
+        """
         B, S, C, L = x.shape
         x_flat = x.view(B * S, C, L)
-        a_plv_flat = a_plv.view(B * S, C, C)
-
-        A_prior = self.prior_builder(a_plv_flat)
-        feat = self.feature_extractor(x_flat) # (B*S, C, D)
-
-        # GAT 分支 + 稳定性 Norm
-        tagat_out = self.norm_t(self.tagat(feat))              
-        scgat_out, s_logits = self.scgat(feat, A_prior)
-        scgat_out = self.norm_s(scgat_out)
-
-        fused = self.gate_fusion(tagat_out.mean(1), scgat_out.mean(1))
         
-        seq_feat = fused.view(B, S, -1)
-        out, _ = self.context_bilstm(seq_feat)
+        # 1. TCN 提取各通道特征
+        # 将 B*S*C 展平送入 TCN
+        feat_raw = self.tcn(x_flat.view(B*S*C, 1, L)) 
+        feat = feat_raw.view(B * S, C, -1) # (B*S, 3, 128)
         
-        logits = self.classifier(out[:, S//2, :])
-        return logits, s_logits
+        # 2. 分支一：MCGAT (维度从 3 变为 1)
+        out_m = self.mcgat(feat, A_fc.view(B*S, C, C)) # (B*S, 256)
+        
+        # 3. 分支二：TRGAT (维度从 5 变为 1)
+        # 输入取通道平均值作为 Epoch 初始表示
+        out_t, s_logits = self.trgat(feat.mean(dim=1), P_matrix) # (B*S, 256)
+        
+        # 4. 融合
+        fused = self.norm(self.fusion(out_m, out_t))
+        
+        # 5. 序列处理与跨 Epoch 记忆
+        seq_in = fused.view(B, S, -1)
+        # 如果是新的受试者，hidden 为 None；如果是连续序列，传入上一轮的 hidden
+        lstm_out, new_hidden = self.bilstm(seq_in, hidden)
+        
+        # 取序列中间的 Epoch 作为分类结果 (或对整个序列分类)
+        logits = self.classifier(lstm_out) # (B, S, 5)
+        
+        return logits, s_logits, new_hidden
 
 
 class TCNResidualBlock(nn.Module):
@@ -117,7 +129,7 @@ class EnhancedResTCN(nn.Module):
         return self.fc(x)
 
 class FeatureExtractor(nn.Module):
-    def __init__(self, num_channels=6, fs=100, feature_dim=128):
+    def __init__(self, num_channels=3, fs=100, feature_dim=128):
         super(FeatureExtractor, self).__init__()
         self.C = num_channels
         self.fs = fs
@@ -131,122 +143,87 @@ class FeatureExtractor(nn.Module):
         out = features.view(B_S, C, -1)  # (B_S, C, feature_dim)
         return out
     
-class PriorMatrixBuilder(nn.Module):
-    def __init__(self, channel_names, sigma=1.0, beta=10.0, tau=0.5):
-        super(PriorMatrixBuilder, self).__init__()
-        self.C = len(channel_names)
-        self.sigma = sigma
-        self.beta = beta
-        self.tau = tau
+class MCGAT(nn.Module):
+    def __init__(self, in_dim, out_dim, num_heads=4, num_channels=3):
+        super(MCGAT, self).__init__()
+        self.heads = num_heads
+        self.head_dim = out_dim // num_heads
+        self.num_channels = num_channels
         
-        coords = {
-            "C3-A2": [-0.707, 0.0, 0.707],  "C4-A1": [0.707, 0.0, 0.707],
-            "O1-A2": [-0.4, -0.9, 0.1],     "O2-A1": [0.4, -0.9, 0.1],
-            "F3-A2": [-0.4, 0.8, 0.4],      "F4-A1": [0.4, 0.8, 0.4],
-            "EEG Fpz-Cz":[0.0, 0.95, 0.2],  "EEG Pz-Oz":[0.0,-0.95,0.2]  
-        }
-        pos_list = [coords.get(name, [0.0, 0.0, 0.0]) for name in channel_names]
-        pos = torch.tensor(pos_list, dtype=torch.float32) 
+        self.W = nn.Linear(in_dim, out_dim, bias=False)
+        self.a = nn.Parameter(torch.Tensor(num_heads, 2 * self.head_dim))
+        self.leakyrelu = nn.LeakyReLU(0.2)
+        self.dropout = nn.Dropout(0.3)
         
-        dist = torch.cdist(pos, pos, p=2) 
-        self.register_buffer('A_geo', torch.exp(-(dist**2) / (self.sigma**2))) 
-        
-        self.weight_fusion = nn.Parameter(torch.tensor([0.5, 0.5])) 
-        self.E = nn.Parameter(torch.randn(self.C, self.C) * 0.01) 
-
-    def forward(self, A_plv):
-        # A_plv: (B*S, C, C) 取 batch 平均以获得稳定的先验
-        A_plv_mean = A_plv.mean(dim=0)
-        
-        w = torch.softmax(self.weight_fusion, dim=0)
-        A_0 = w[0] * self.A_geo + w[1] * A_plv_mean
-        
-        A_init = A_0 * F.softplus(self.E) 
-        A_init = (A_init + A_init.T) / 2 
-        
-        mask = 1.0 - torch.eye(self.C, device=A_init.device)
-        A_init = A_init * mask 
-        
-        A_init = torch.sigmoid(self.beta * (A_init - self.tau))
-        return A_init
-
-class SCGAT(nn.Module):
-    def __init__(self, in_channels, out_channels, stage_dim=64, num_stages=5, num_heads=4):
-        super(SCGAT, self).__init__()
-        self.num_heads = num_heads
-        self.d_k = out_channels // num_heads
-        
-        self.lin_project = nn.Linear(in_channels, out_channels)
-        self.stage_mlp = nn.Sequential(
-            nn.Linear(in_channels, 128), nn.ReLU(),
-            nn.Linear(128, num_stages)
-        )
-        self.mlp_c = nn.Sequential(
-            nn.Linear(num_stages, stage_dim), nn.ReLU(), 
-            nn.Linear(stage_dim, stage_dim)
+        # 维度对齐核心：通道重要性聚合
+        self.channel_agg = nn.Sequential(
+            nn.Linear(out_dim, 64),
+            nn.Tanh(),
+            nn.Linear(64, 1)
         )
         
-        self.att_scorer = nn.Linear(2 * self.d_k + stage_dim, 1, bias=False)
-        self.lambda_prior = nn.Parameter(torch.ones(num_heads))
+        nn.init.xavier_uniform_(self.a)
 
-    def forward(self, x, A_prior):
-        B, C, _ = x.shape
-        x_proj = self.lin_project(x).view(B, C, self.num_heads, self.d_k)
+    def forward(self, h, A_fc):
+        # h: (B*S, 3, in_dim), A_fc: (B*S, 3, 3)
+        BS, C, D = h.size()
+        Wh = self.W(h).view(BS, C, self.heads, self.head_dim) # (BS, 3, 4, D/4)
         
-        s_logits = self.stage_mlp(x.mean(dim=1))
-        s_prob = F.softmax(s_logits, dim=-1)
-        c = self.mlp_c(s_prob) 
+        # 构造 Attention Score
+        Wh_i = Wh.unsqueeze(2).expand(BS, C, C, self.heads, self.head_dim)
+        Wh_j = Wh.unsqueeze(1).expand(BS, C, C, self.heads, self.head_dim)
+        e = torch.einsum('nijhd,hd->nijh', torch.cat([Wh_i, Wh_j], dim=-1), self.a)
+        e = self.leakyrelu(e).permute(0, 3, 1, 2) # (BS, heads, 3, 3)
         
-        x_dst = x_proj.unsqueeze(2).expand(-1, -1, C, -1, -1) 
-        x_src = x_proj.unsqueeze(1).expand(-1, C, -1, -1, -1) 
-        c_rep = c.view(B, 1, 1, 1, -1).expand(-1, C, C, self.num_heads, -1)
+        # 融入 A_fc 先验：公式 alpha = Softmax(e * A_fc)
+        A_prior = A_fc.unsqueeze(1) # (BS, 1, 3, 3)
+        attention = F.softmax(e * A_prior, dim=-1)
+        attention = self.dropout(attention)
         
-        att_input = torch.cat([x_src, x_dst, c_rep], dim=-1) 
-        e = F.leaky_relu(self.att_scorer(att_input).squeeze(-1), 0.2) 
+        # 更新特征
+        h_prime = torch.matmul(attention, Wh.permute(0, 2, 1, 3)) # (BS, heads, 3, head_dim)
+        h_prime = h_prime.permute(0, 2, 1, 3).contiguous().view(BS, C, -1) # (BS, 3, out_dim)
         
-        prior_term = self.lambda_prior.view(1, 1, 1, -1) * torch.log(A_prior.unsqueeze(0).unsqueeze(-1) + 1e-9)
-        combined_e = e + prior_term
-        
-        alpha = F.softmax(combined_e, dim=2) 
-        
-        alpha = alpha.unsqueeze(-1) 
-        x_val = x_proj.unsqueeze(1).expand(-1, C, -1, -1, -1) 
-        out = (alpha * x_val).sum(dim=2) 
-        
-        return out.reshape(B, C, -1), s_logits
+        # 【对齐】：3个通道 -> 1个特征向量
+        w = F.softmax(self.channel_agg(h_prime), dim=1) # (BS, 3, 1)
+        out = torch.sum(h_prime * w, dim=1) # (BS, out_dim)
+        return out
     
-class TAGAT(nn.Module):
-    def __init__(self, in_dim, hid_dim, num_nodes, t_enc_dim=32, num_heads=4):
-        super(TAGAT, self).__init__()
-        self.num_heads = num_heads
-        self.d_k = hid_dim // num_heads
-        self.lin_project = nn.Linear(in_dim, hid_dim)
-        self.node_time_pos = nn.Parameter(torch.randn(num_nodes, 1))
-        self.time_mlp = nn.Sequential(nn.Linear(1, t_enc_dim), nn.ReLU(), nn.Linear(t_enc_dim, t_enc_dim))
+class TRGAT(nn.Module):
+    def __init__(self, in_dim, out_dim, num_heads=4, num_stages=5):
+        super(TRGAT, self).__init__()
+        self.num_stages = num_stages
+        self.out_dim = out_dim
         
-        self.att_scorer = nn.Linear(2 * self.d_k + t_enc_dim, 1, bias=False)
+        # 5个全局睡眠阶段原型节点
+        self.stage_nodes = nn.Parameter(torch.randn(num_stages, out_dim))
+        self.W_q = nn.Linear(in_dim, out_dim)
+        self.W_k = nn.Linear(out_dim, out_dim)
+        
+        # 阶段内 GAT 权重
+        self.W_gat = nn.Linear(out_dim, out_dim)
+        self.a_gat = nn.Parameter(torch.Tensor(num_heads, 2 * (out_dim//num_heads)))
+        nn.init.xavier_uniform_(self.a_gat)
 
-    def forward(self, x):
-        B, C, _ = x.shape
-        x_proj = self.lin_project(x).view(B, C, self.num_heads, self.d_k)
+    def forward(self, x_epoch, P_matrix):
+        # x_epoch: (BS, in_dim), P_matrix: (5, 5)
+        BS = x_epoch.size(0)
         
-        tau = self.node_time_pos.unsqueeze(1) - self.node_time_pos.unsqueeze(0) 
-        t_enc = self.time_mlp(tau) 
+        # 1. 阶段节点相互作用 (融入 P_matrix 转移先验)
+        # 这里简化处理：直接利用 P_matrix 引导节点间特征流动
+        updated_stages = torch.matmul(P_matrix, self.stage_nodes) # (5, out_dim)
         
-        x_dst = x_proj.unsqueeze(2).expand(-1, -1, C, -1, -1) 
-        x_src = x_proj.unsqueeze(1).expand(-1, C, -1, -1, -1) 
-        t_enc_rep = t_enc.unsqueeze(0).unsqueeze(3).expand(B, -1, -1, self.num_heads, -1)
+        # 2. 【对齐】：当前特征与5个阶段节点做 Cross-Attention
+        query = self.W_q(x_epoch).unsqueeze(1) # (BS, 1, out_dim)
+        keys = self.W_k(updated_stages).unsqueeze(0) # (1, 5, out_dim)
         
-        att_input = torch.cat([x_src, x_dst, t_enc_rep], dim=-1)
-        e = F.leaky_relu(self.att_scorer(att_input).squeeze(-1), 0.2)
+        # 计算该 Epoch 对应各阶段的相似度 (辅助分类 Logits)
+        energy = torch.sum(query * keys, dim=-1) / (self.out_dim ** 0.5) # (BS, 5)
+        s_probs = F.softmax(energy, dim=-1).unsqueeze(-1) # (BS, 5, 1)
         
-        alpha = F.softmax(e, dim=2)
-        
-        alpha = alpha.unsqueeze(-1) 
-        x_val = x_proj.unsqueeze(1).expand(-1, C, -1, -1, -1) 
-        out = (alpha * x_val).sum(dim=2)
-        
-        return out.reshape(B, C, -1)
+        # 根据概率重构特征：(BS, 5, 1) * (1, 5, out_dim) -> (BS, out_dim)
+        out = torch.sum(s_probs * updated_stages.unsqueeze(0), dim=1)
+        return out, energy
     
 class GatedFusion(nn.Module):
     def __init__(self, dim):
@@ -259,20 +236,6 @@ class GatedFusion(nn.Module):
         z = self.sigmoid(self.fc(combined)) 
         return z * x1 + (1 - z) * x2
 
-class ChannelAttention(nn.Module):
-    def __init__(self, dim):
-        super(ChannelAttention, self).__init__()
-        self.att = nn.Sequential(
-            nn.Linear(dim, dim // 2),
-            nn.ReLU(),
-            nn.Linear(dim // 2, 1),
-            nn.Softmax(dim=1) # 在通道维度进行 Softmax
-        )
-
-    def forward(self, x):
-        # x: (B*T, C, D)
-        weights = self.att(x) # (B*T, C, 1)
-        return x * weights, weights
 
 class BiLSTM(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_layers=1, dropout=0.2):
