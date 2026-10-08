@@ -1,0 +1,37 @@
+# Python and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Private datasets and experiment output
+data/
+datasets/
+*.edf
+*.pt
+*.pth
+*.ckpt
+outputs/
+checkpoints*/
+runs/
+events.out.tfevents.*
+
+# Word lock files and intermediate patent work
+~$*
+render*/
+tmp_render/
+PA2611182CN-*.docx
+专利初稿格式模板*.docx
+SleepGAT_ablation_experiment_table_estimated.docx
+Codex使用说明.txt
+Snipaste_*.jpg
+
+# Working documents; the authoritative draft is tracked at the root
+SleepGAT/*.docx
+SleepGAT_ablation_experiment_table.docx
+SleepGAT/generated_figures/
+SleepGAT/Figure_1.png

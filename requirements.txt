@@ -1,0 +1,13 @@
+# Direct dependencies inferred from SleepGAT and the plotting utilities.
+# Original training environment versions were not recorded; this is not a lockfile.
+torch
+numpy
+scipy
+mne
+pyedflib
+pandas
+scikit-learn
+matplotlib
+seaborn
+tensorboard
+pytest

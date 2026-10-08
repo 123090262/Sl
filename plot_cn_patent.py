@@ -16,6 +16,8 @@ METRIC_VALUES = (85.34, 83.37, 80.47)
 METRIC_ERRORS = (1.20, 1.80, 1.50)
 BAR_COLORS = ("#595959", "#969696", "#D0D0D0")
 PREFERRED_FONTS = ("Microsoft YaHei", "SimHei", "Noto Sans CJK SC")
+AXIS_LABEL_SIZE = 16
+TICK_LABEL_SIZE = 15
 
 
 def _configure_fonts() -> None:
@@ -60,8 +62,9 @@ def create_chart(output_dir: Path) -> tuple[Path, Path]:
             "capthick": 1.4,
         },
     )
-    axes.set_ylabel("性能指标（%）")
+    axes.set_ylabel("性能指标（%）", fontsize=AXIS_LABEL_SIZE)
     axes.set_ylim(40, 100)
+    axes.tick_params(axis="both", labelsize=TICK_LABEL_SIZE)
     axes.grid(axis="y", linestyle="--", color="#BFBFBF", alpha=0.55)
     axes.set_axisbelow(True)
 

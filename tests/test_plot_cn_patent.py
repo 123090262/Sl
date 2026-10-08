@@ -1,6 +1,12 @@
 from pathlib import Path
 
-from plot_cn_patent import create_chart
+from plot_cn_patent import AXIS_LABEL_SIZE, TICK_LABEL_SIZE, create_chart
+
+
+def test_coordinate_fonts_are_larger_for_document_readability() -> None:
+    """Catch regressions that make chart coordinates too small in Word."""
+    assert AXIS_LABEL_SIZE >= 16
+    assert TICK_LABEL_SIZE >= 15
 
 
 def test_create_chart_writes_png_and_svg(tmp_path: Path) -> None:
